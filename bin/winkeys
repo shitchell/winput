@@ -24,7 +24,10 @@ global options:
   --screens           print screen geometry and exit
   --pointer           print pointer position and exit
   --windows           list switchable windows and exit
+  --monitors          list monitors in rotation order and exit
   --focus TEXT        focus the window matching TEXT (title or process) first
+  --move-window N     move the focused window N monitors along the rotation
+                      (1 = next, -1 = previous); layout-agnostic
   -h, --help
 
 examples:
@@ -42,7 +45,7 @@ if (!argv.length || argv.includes('-h') || argv.includes('--help')) {
 
 const actions = [];
 let after = 0, delay = 8, showScreens = false, showPointer = false;
-let showWindows = false, focusWant = null;
+let showWindows = false, focusWant = null, showMonitors = false, moveWindow = 0;
 
 function typeText(text) {
   const lines = text.split('\n');
@@ -70,6 +73,8 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--screens') showScreens = true;
   else if (a === '--pointer') showPointer = true;
   else if (a === '--windows') showWindows = true;
+  else if (a === '--monitors') showMonitors = true;
+  else if (a === '--move-window') moveWindow = parseInt(next(), 10);
   else if (a === '--focus') focusWant = next();
   else if (a === '-') typeText(require('fs').readFileSync(0, 'utf8').replace(/\n$/, ''));
   else if (a.startsWith('--')) { process.stderr.write(`winkeys: unknown option ${a}\n`); process.exit(2); }
@@ -79,8 +84,13 @@ for (let i = 0; i < argv.length; i++) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 (async function main() {
-  if (showWindows || focusWant) {
+  if (showWindows || focusWant || showMonitors || moveWindow) {
     const cache = robot.winCache();
+    if (showMonitors) {
+      for (const m of wincl.monitors(cache)) {
+        process.stdout.write(`monitor ${m.index} ${m.w}x${m.h} at ${m.x},${m.y}${m.primary ? ' (primary)' : ''}\n`);
+      }
+    }
     if (showWindows) {
       for (const w of wincl.list(cache)) {
         process.stdout.write(`${w.focused ? '*' : ' '} ${w.proc.padEnd(18)} ${w.title}\n`);
@@ -92,6 +102,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       const got = wincl.focus(cache, win.hwnd);
       process.stdout.write(`focus -> ${win.proc} - ${win.title}${got && got.hwnd === win.hwnd ? '' : '  (refused)'}\n`);
       if (actions.length) await sleep(150);   // let the new window settle
+    }
+    if (moveWindow) {
+      const fg = wincl.foreground(cache);
+      if (!fg) { process.stderr.write('winkeys: no focused window\n'); process.exit(1); }
+      const moved = wincl.moveToMonitor(cache, fg.hwnd, moveWindow);
+      process.stdout.write(moved
+        ? `moved ${fg.proc} -> ${moved.x},${moved.y} ${moved.w}x${moved.h}\n`
+        : `could not move ${fg.proc} (only one monitor?)\n`);
     }
     if (!actions.length && !showScreens && !showPointer) return;
   }

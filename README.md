@@ -160,8 +160,46 @@ size:
 Wheel and all three buttons are forwarded. Drags work (press and release are
 sent separately).
 
-To move a window between monitors without dragging at all, `Ctrl-] Right` /
-`Ctrl-] Left` send Windows' own Win+Shift+Arrow.
+## Moving a window to another monitor
+
+`Ctrl-] Right` / `Ctrl-] Left` move the focused window one monitor along a
+rotation, or from the shell:
+
+```sh
+winkeys --monitors            # monitors in rotation order
+winkeys --move-window 1       # focused window to the next monitor
+winkeys --move-window -1      # previous
+```
+
+This deliberately does **not** use Windows' Win+Shift+Arrow. That shortcut is
+*direction*-based, so it does nothing when monitors are stacked vertically
+rather than side by side (and Win+Shift+Up/Down are already maximise/minimise,
+so there is no vertical equivalent). Instead the window is moved with
+`SetWindowPos` through a rotation sorted top-to-bottom then left-to-right,
+which behaves the same whatever the arrangement. Position and size are kept
+proportional to the target's work area, and a maximised window is restored,
+moved, and re-maximised.
+
+### Two DPI traps this has to work around
+
+Both cost real debugging time, so they are worth knowing:
+
+1. **A DPI-unaware process gets its coordinates rewritten.** On a mixed-DPI
+   setup (here: 125% primary, 100% external) Windows silently rescales what you
+   pass to `SetWindowPos`, so a move lands at the wrong size. WinCtl calls
+   `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` so it works in real
+   pixels.
+2. **The app resizes itself afterwards.** Crossing to a different-DPI monitor
+   makes Windows send `WM_DPICHANGED`, and the application then applies its own
+   sizing, overriding the placement. So the move places the window, waits for
+   that to settle, and re-applies — the second pass triggers no DPI change
+   because the window is already on the target monitor.
+
+Because of trap 1, `winkeys --monitors` reports **physical** pixels while
+`winkeys --screens` reports the **DPI-scaled** space the mouse uses. On a
+125%-scaled display the same monitor shows as 1920x1080 in one and 1536x864 in
+the other. That is expected: mouse positioning goes through Robot's scaled
+space, window geometry goes through Win32's physical space.
 
 ### Motion is coalesced
 
