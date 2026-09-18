@@ -12,6 +12,8 @@ usage: winput [options]
   -s, --screen N     screen index for absolute mouse (default: primary)
   -M, --no-mouse     do not capture the mouse
   -r, --relative     start in relative mouse mode
+  -A, --all-screens  map the terminal to ALL monitors at once, so the pointer
+                     can cross between them (good for dragging windows)
       --sens N       pixels per cell in relative mode (default 12)
   -E, --no-echo      do not echo what is sent
   -p, --prefix SPEC  escape key; repeatable. C-] ctrl+x ^x M-x alt+x f1..f12
@@ -29,13 +31,14 @@ prefix (Ctrl-] by default) followed by:
   s        cycle screen      prefix  send the prefix key itself
   Tab      next window       S-Tab   previous window
   w        pick a window     f       show which window has focus
+  Right    move focused window to the next monitor    Left  previous monitor
 
 If the prefix never reaches winput (a terminal or multiplexer may eat it),
 run  winput --debug-keys  to see what your terminal really sends, then pick
 something else, e.g.  winput -p f12  or  winput -p C-g.
 `;
 
-const opts = { screen: null, mouse: true, relative: false, sens: 12, echo: true, prefix: [], delay: 8, debugKeys: false, focus: null };
+const opts = { screen: null, mouse: true, relative: false, allScreens: false, sens: 12, echo: true, prefix: [], delay: 8, debugKeys: false, focus: null };
 const argv = process.argv.slice(2);
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -43,6 +46,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '-s' || a === '--screen') opts.screen = parseInt(argv[++i], 10);
   else if (a === '-M' || a === '--no-mouse') opts.mouse = false;
   else if (a === '-r' || a === '--relative') opts.relative = true;
+  else if (a === '-A' || a === '--all-screens') opts.allScreens = true;
   else if (a === '--sens') opts.sens = parseInt(argv[++i], 10);
   else if (a === '-E' || a === '--no-echo') opts.echo = false;
   else if (a === '-p' || a === '--prefix') opts.prefix.push(argv[++i]);
@@ -94,7 +98,7 @@ const dim = (s) => `\x1b[2m${s}\x1b[22m`;
 const out = (s) => process.stdout.write(s);
 const note = (s) => out(`\r\n\x1b[36m${s}\x1b[0m\r\n`);
 
-let server, screens, target, ptr, bounds, cache;
+let server, screens, targets, target, ptr, bounds, cache;
 let windows = [], winIndex = -1, lastCycle = 0, picking = false;
 let mouseOn = opts.mouse, relative = opts.relative, lastCell = null, prefixArmed = false;
 
@@ -102,9 +106,30 @@ function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
 
 function send(line) { server.send(line); }
 
+// Pointer position is idempotent, so a burst of motion collapses to its last
+// value instead of queueing. Without this a fast sweep outruns the server and
+// the backlog replays for far longer than the movement took.
+const MOVE_MIN_MS = 6;
+let pendingMove = null, moveTimer = null, lastMoveAt = 0, lastSent = null;
+
+function flushMove() {
+  if (moveTimer) { clearTimeout(moveTimer); moveTimer = null; }
+  if (!pendingMove) return;
+  const { x, y } = pendingMove;
+  pendingMove = null;
+  if (lastSent && lastSent.x === x && lastSent.y === y) return;   // same pixel
+  lastSent = { x, y };
+  lastMoveAt = Date.now();
+  send(`m ${x} ${y}`);
+}
+
 function moveAbs(x, y) {
   ptr = { x: clamp(x, bounds.x0, bounds.x1), y: clamp(y, bounds.y0, bounds.y1) };
-  send(`m ${ptr.x} ${ptr.y}`);
+  pendingMove = { x: ptr.x, y: ptr.y };
+  if (moveTimer) return;
+  const since = Date.now() - lastMoveAt;
+  if (since >= MOVE_MIN_MS) flushMove();
+  else moveTimer = setTimeout(flushMove, MOVE_MIN_MS - since);
 }
 
 // Absolute mode treats the terminal window as the screen; relative mode
@@ -123,9 +148,10 @@ function onMouseCell(x, y) {
 
 function onMouse(ev) {
   const button = ev.b & 3;
-  if (ev.b & 64) { send(`w ${button === 0 ? -1 : 1}`); return; }  // 64 up, 65 down
+  if (ev.b & 64) { flushMove(); send(`w ${button === 0 ? -1 : 1}`); return; }  // 64 up, 65 down
   onMouseCell(ev.x, ev.y);
   if (ev.b & 32) return;                                          // motion only
+  flushMove();                       // click where the pointer actually is
   const jb = button === 0 ? 1 : button === 1 ? 2 : 3;
   send(`b ${jb} ${ev.press ? 'down' : 'up'}`);
   if (opts.echo && !ev.press) out(dim(`⟨click${jb}⟩`));
@@ -264,15 +290,27 @@ function pick(ev) {
     : `focus refused by Windows -> ${want.proc} - ${want.title}`);
 }
 
+function screenLabel(t) {
+  return t.index === 'all'
+    ? `all screens ${t.w}x${t.h}`
+    : `screen ${t.index} ${t.id} ${t.w}x${t.h}`;
+}
+
 function cycleScreen() {
-  target = screens[(screens.indexOf(target) + 1) % screens.length];
-  note(`mouse -> screen ${target.index} ${target.id} ${target.w}x${target.h}`);
+  target = targets[(targets.indexOf(target) + 1) % targets.length];
+  lastCell = null;
+  note(`mouse -> ${screenLabel(target)}`);
 }
 
 function handlePrefix(ev) {
   if (matchesPrefix(ev)) { emit(ev); return; }          // prefix twice = send it
   if (ev.type === 'key' && ev.key === 'tab') { cycleWindow(1); return; }
   if (ev.type === 'chord' && ev.spec === 'shift+tab') { cycleWindow(-1); return; }
+  if (ev.type === 'key' && (ev.key === 'right' || ev.key === 'left')) {
+    send(`c win+shift+${ev.key}`);                 // Windows' own move-to-monitor
+    note(`move window to ${ev.key === 'right' ? 'next' : 'previous'} monitor`);
+    return;
+  }
   if (ev.type !== 'text' || !ev.text.length) { note('prefix cancelled'); return; }
   const ch = ev.text[0];
   const rest = ev.text.slice(1);
@@ -396,21 +434,30 @@ function attachStdin() {
 
   cache = robot.winCache();
   screens = await robot.screens(server);
-  target = opts.screen != null
-    ? (screens.find((s) => s.index === opts.screen) || screens[0])
-    : (screens.find((s) => s.primary) || screens[0]);
   bounds = {
     x0: Math.min(...screens.map((s) => s.x)),
     y0: Math.min(...screens.map((s) => s.y)),
     x1: Math.max(...screens.map((s) => s.x + s.w - 1)),
     y1: Math.max(...screens.map((s) => s.y + s.h - 1)),
   };
+  // The union spans every monitor, so mapping the terminal to it lets the
+  // pointer cross between them - which is what dragging a window needs.
+  targets = screens.concat([{
+    index: 'all', id: 'all', primary: false,
+    x: bounds.x0, y: bounds.y0,
+    w: bounds.x1 - bounds.x0 + 1, h: bounds.y1 - bounds.y0 + 1,
+  }]);
+  target = opts.allScreens
+    ? targets[targets.length - 1]
+    : opts.screen != null
+      ? (screens.find((s) => s.index === opts.screen) || screens[0])
+      : (screens.find((s) => s.primary) || screens[0]);
   ptr = await robot.pointer(server);
 
   const pfx = PREFIX_LABEL;
   out(`\x1b[36mwinput\x1b[0m connected - keystrokes now go to the focused Windows window.\r\n`);
   out(dim(`  screens: ${screens.map((s) => `${s.index}:${s.w}x${s.h}${s.primary ? '*' : ''}`).join('  ')}`) + '\r\n');
-  out(dim(`  mouse: ${mouseOn ? (relative ? 'relative' : 'absolute -> screen ' + target.index) : 'off'}   ${pfx} ? for help, ${pfx} q to quit`) + '\r\n');
+  out(dim(`  mouse: ${mouseOn ? (relative ? 'relative' : 'absolute -> ' + screenLabel(target)) : 'off'}   ${pfx} ? for help, ${pfx} q to quit`) + '\r\n');
 
   if (opts.focus) {
     const win = wincl.match(wincl.list(cache), opts.focus);

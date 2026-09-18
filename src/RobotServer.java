@@ -44,7 +44,12 @@ public class RobotServer {
             case 'u': robot.keyRelease(key(rest.trim())); return "ok";
             case 'm': {
                 String[] p = rest.trim().split("\\s+");
-                robot.mouseMove(Integer.parseInt(p[0]), Integer.parseInt(p[1]));
+                // No autoDelay for motion: position is idempotent, and the delay
+                // caps throughput at ~87 moves/sec, which a fast mouse outruns.
+                int keep = robot.getAutoDelay();
+                robot.setAutoDelay(0);
+                try { robot.mouseMove(Integer.parseInt(p[0]), Integer.parseInt(p[1])); }
+                finally { robot.setAutoDelay(keep); }
                 return "ok";
             }
             case 'b': return button(rest.trim());

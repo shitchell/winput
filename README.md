@@ -38,6 +38,7 @@ winput [options]
   -s, --screen N     screen index for absolute mouse (default: primary)
   -M, --no-mouse     do not capture the mouse
   -r, --relative     start in relative mouse mode
+  -A, --all-screens  map the terminal to every monitor at once
       --sens N       pixels per cell in relative mode (default 12)
   -E, --no-echo      do not echo what is sent
   -p, --prefix SPEC  escape key; repeatable (default: C-])
@@ -57,6 +58,7 @@ itself, press the prefix (**Ctrl-]**) then:
 | `r` | toggle relative / absolute mouse |
 | `s` | cycle target screen |
 | `Tab` / `Shift-Tab` | next / previous window |
+| `Right` / `Left` | move the focused window to the next / previous monitor |
 | `w` | pick a window from a numbered list |
 | `f` | show which window currently has focus |
 | the prefix again | send the prefix key itself |
@@ -135,6 +137,11 @@ and modified arrows such as Ctrl-Right.
 Mouse capture needs a terminal that speaks xterm mouse reporting (Windows
 Terminal, iTerm2, kitty, most Android/iOS ssh clients). It is on by default.
 
+The terminal window maps onto the screen proportionally: a cell at 50% across
+your terminal puts the pointer at 50% across the target, offset by that
+monitor's origin. On an 80-column terminal, column 40 lands near x=632 of a
+1280-wide screen (the half-cell offset centres it in the cell).
+
 Terminals report *cells*, not pixels, so precision is bounded by your terminal
 size:
 
@@ -144,8 +151,26 @@ size:
 - **relative** (`Ctrl-] r`) — cell movement becomes a delta of `--sens` px, so
   repeated small motions reach any pixel. Use this when absolute is too coarse.
 
+- **all screens** (`-A`, or `Ctrl-] s` to cycle onto it) — the terminal maps to
+  the union of every monitor instead of one, so the pointer can cross between
+  them. This is what you want for dragging a window to another display.
+  Note the union includes dead space when monitors differ in size or alignment;
+  the pointer simply will not go there.
+
 Wheel and all three buttons are forwarded. Drags work (press and release are
 sent separately).
+
+To move a window between monitors without dragging at all, `Ctrl-] Right` /
+`Ctrl-] Left` send Windows' own Win+Shift+Arrow.
+
+### Motion is coalesced
+
+Pointer position is idempotent, so only the newest one matters. A burst of
+motion collapses to its final value rather than queueing — in testing, 60
+motion events in one chunk became 2 sends. Mouse moves also skip the
+inter-event delay that keystrokes need (that delay caps throughput near 87
+moves/sec, which a fast sweep across a wide terminal easily outruns; the
+backlog then replays for far longer than the movement took).
 
 ## winkeys — one-shot
 
