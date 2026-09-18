@@ -1,0 +1,121 @@
+#!/usr/bin/env node
+'use strict';
+// winkeys - one-shot input sender, for scripts and one-liners.
+const robot = require('../lib/robot.js');
+const wincl = require('../lib/wincl.js');
+
+const HELP = `winkeys - send keystrokes/mouse events to the focused Windows window
+
+usage: winkeys [global opts] <action> [<action> ...]
+
+actions (applied in the order given):
+  <text>              type text ("\\n" and "\\t" are honoured)
+  -                   type text read from stdin
+  -k, --key NAME      tap a key: enter tab esc bksp del up f5 pgdn ...
+  -c, --chord SPEC    chord: ctrl+c, ctrl+shift+t, alt+f4, win+d
+  -m, --move X,Y      move the pointer (virtual desktop pixels)
+  -b, --click N       click button 1=left 2=middle 3=right
+  -w, --wheel N       wheel notches (negative scrolls up)
+  -S, --sleep MS      pause
+
+global options:
+  --after MS          wait before sending anything (default 0)
+  --delay MS          inter-event delay on the Windows side (default 8)
+  --screens           print screen geometry and exit
+  --pointer           print pointer position and exit
+  --windows           list switchable windows and exit
+  --focus TEXT        focus the window matching TEXT (title or process) first
+  -h, --help
+
+examples:
+  winkeys 'tt\\n'
+  winkeys -c alt+tab
+  winkeys --after 3000 'hello' -k enter
+  winkeys --focus Ubuntu 'ls -la' -k enter
+`;
+
+const argv = process.argv.slice(2);
+if (!argv.length || argv.includes('-h') || argv.includes('--help')) {
+  process.stdout.write(HELP);
+  process.exit(argv.length ? 0 : 2);
+}
+
+const actions = [];
+let after = 0, delay = 8, showScreens = false, showPointer = false;
+let showWindows = false, focusWant = null;
+
+function typeText(text) {
+  const lines = text.split('\n');
+  lines.forEach((line, i) => {
+    if (i) actions.push('k enter');
+    if (line.length) actions.push(`t ${line}`);
+  });
+}
+
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  const next = () => {
+    const v = argv[++i];
+    if (v === undefined) { process.stderr.write(`winkeys: ${a} needs a value\n`); process.exit(2); }
+    return v;
+  };
+  if (a === '-k' || a === '--key') actions.push(`k ${next()}`);
+  else if (a === '-c' || a === '--chord') actions.push(`c ${next()}`);
+  else if (a === '-m' || a === '--move') actions.push(`m ${next().replace(/[,:]/g, ' ')}`);
+  else if (a === '-b' || a === '--click') actions.push(`b ${next()} click`);
+  else if (a === '-w' || a === '--wheel') actions.push(`w ${next()}`);
+  else if (a === '-S' || a === '--sleep') actions.push(`s ${next()}`);
+  else if (a === '--after') after = parseInt(next(), 10);
+  else if (a === '--delay') delay = parseInt(next(), 10);
+  else if (a === '--screens') showScreens = true;
+  else if (a === '--pointer') showPointer = true;
+  else if (a === '--windows') showWindows = true;
+  else if (a === '--focus') focusWant = next();
+  else if (a === '-') typeText(require('fs').readFileSync(0, 'utf8').replace(/\n$/, ''));
+  else if (a.startsWith('--')) { process.stderr.write(`winkeys: unknown option ${a}\n`); process.exit(2); }
+  else typeText(a.replace(/\\n/g, '\n').replace(/\\t/g, '\t'));
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+(async function main() {
+  if (showWindows || focusWant) {
+    const cache = robot.winCache();
+    if (showWindows) {
+      for (const w of wincl.list(cache)) {
+        process.stdout.write(`${w.focused ? '*' : ' '} ${w.proc.padEnd(18)} ${w.title}\n`);
+      }
+    }
+    if (focusWant) {
+      const win = wincl.match(wincl.list(cache), focusWant);
+      if (!win) { process.stderr.write(`winkeys: no window matching '${focusWant}'\n`); process.exit(1); }
+      const got = wincl.focus(cache, win.hwnd);
+      process.stdout.write(`focus -> ${win.proc} - ${win.title}${got && got.hwnd === win.hwnd ? '' : '  (refused)'}\n`);
+      if (actions.length) await sleep(150);   // let the new window settle
+    }
+    if (!actions.length && !showScreens && !showPointer) return;
+  }
+
+  const server = robot.start({ delay });
+  server.proc.stderr.on('data', (d) => process.stderr.write(`[java] ${d}`));
+  await server.ready();
+
+  if (showScreens) {
+    for (const s of await robot.screens(server)) {
+      process.stdout.write(`screen ${s.index} ${s.id} ${s.w}x${s.h} at ${s.x},${s.y}${s.primary ? ' (primary)' : ''}\n`);
+    }
+  }
+  if (showPointer) {
+    const p = await robot.pointer(server);
+    process.stdout.write(`pointer ${p.x},${p.y}\n`);
+  }
+
+  if (actions.length) {
+    if (after) await sleep(after);
+    for (const line of actions) server.send(line);
+  }
+  await server.close();
+})().catch((e) => {
+  process.stderr.write(`winkeys: ${e.message}\n`);
+  process.exit(1);
+});

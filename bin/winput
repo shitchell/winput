@@ -1,0 +1,444 @@
+#!/usr/bin/env node
+'use strict';
+// winput - turn this terminal into a keyboard (and mouse) for the Windows desktop.
+// Run it over ssh; everything you type is replayed into whatever window has focus.
+const robot = require('../lib/robot.js');
+const wincl = require('../lib/wincl.js');
+
+const HELP = `winput - drive the Windows desktop from this terminal
+
+usage: winput [options]
+
+  -s, --screen N     screen index for absolute mouse (default: primary)
+  -M, --no-mouse     do not capture the mouse
+  -r, --relative     start in relative mouse mode
+      --sens N       pixels per cell in relative mode (default 12)
+  -E, --no-echo      do not echo what is sent
+  -p, --prefix SPEC  escape key; repeatable. C-] ctrl+x ^x M-x alt+x f1..f12
+                     (a bare character means Ctrl-<char>).  default: C-]
+  -d, --delay MS     inter-event delay on the Windows side (default 8)
+  -K, --debug-keys   print what your terminal sends and exit; sends nothing
+  -f, --focus TEXT   focus the window whose title/process matches TEXT, first
+  -h, --help
+
+Everything you type goes to Windows. To talk to winput itself, press the
+prefix (Ctrl-] by default) followed by:
+
+  q or .   quit              m       toggle mouse capture
+  ?        this help         r       toggle relative/absolute mouse
+  s        cycle screen      prefix  send the prefix key itself
+  Tab      next window       S-Tab   previous window
+  w        pick a window     f       show which window has focus
+
+If the prefix never reaches winput (a terminal or multiplexer may eat it),
+run  winput --debug-keys  to see what your terminal really sends, then pick
+something else, e.g.  winput -p f12  or  winput -p C-g.
+`;
+
+const opts = { screen: null, mouse: true, relative: false, sens: 12, echo: true, prefix: [], delay: 8, debugKeys: false, focus: null };
+const argv = process.argv.slice(2);
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a === '-h' || a === '--help') { process.stdout.write(HELP); process.exit(0); }
+  else if (a === '-s' || a === '--screen') opts.screen = parseInt(argv[++i], 10);
+  else if (a === '-M' || a === '--no-mouse') opts.mouse = false;
+  else if (a === '-r' || a === '--relative') opts.relative = true;
+  else if (a === '--sens') opts.sens = parseInt(argv[++i], 10);
+  else if (a === '-E' || a === '--no-echo') opts.echo = false;
+  else if (a === '-p' || a === '--prefix') opts.prefix.push(argv[++i]);
+  else if (a === '-K' || a === '--debug-keys') opts.debugKeys = true;
+  else if (a === '-f' || a === '--focus') opts.focus = argv[++i];
+  else if (a === '-d' || a === '--delay') opts.delay = parseInt(argv[++i], 10);
+  else { process.stderr.write(`winput: unknown option ${a}\n`); process.exit(2); }
+}
+
+if (!process.stdin.isTTY) {
+  process.stderr.write('winput: stdin is not a terminal (use `winkeys` for scripted input)\n');
+  process.exit(2);
+}
+
+// A prefix is matched against a decoded event, not a raw byte, so anything
+// the parser can name - Ctrl-x, Alt-x, F1..F12, Esc - can serve as one.
+function parsePrefix(spec) {
+  const s = String(spec).trim().toLowerCase();
+  let m;
+  if ((m = s.match(/^(?:c-|ctrl\+|\^)(.+)$/))) return modifier('ctrl', m[1], 'Ctrl-');
+  if ((m = s.match(/^(?:m-|alt\+)(.+)$/)))     return modifier('alt', m[1], 'Alt-');
+  if (/^f([1-9]|1[0-2])$/.test(s))             return { type: 'key', key: s, label: s.toUpperCase() };
+  if (s === 'esc' || s === 'escape') {
+    die('Esc cannot be a prefix: terminals send Esc+<char> for Alt-<char>, so it is ambiguous. Try f12 or C-g.');
+  }
+  if (s.length !== 1) die(`bad prefix '${spec}' (expected C-x, M-x, f1..f12, or a single character)`);
+  return { type: 'chord', spec: 'ctrl+' + s, label: 'Ctrl-' + s };
+}
+
+function die(msg) {
+  process.stderr.write(`winput: ${msg}\n`);
+  process.exit(2);
+}
+
+function modifier(mod, key, label) {
+  if (key.length !== 1 && key !== 'space') die(`bad prefix key '${key}' after ${mod}`);
+  return { type: 'chord', spec: `${mod}+${key}`, label: label + key };
+}
+
+const PREFIXES = (opts.prefix.length ? opts.prefix : [']']).map(parsePrefix);
+const PREFIX_LABEL = PREFIXES.map((p) => p.label).join(' or ');
+
+function matchesPrefix(ev) {
+  return PREFIXES.some((p) => p.type === ev.type &&
+    (p.type === 'chord' ? p.spec === ev.spec : p.key === ev.key));
+}
+
+const dim = (s) => `\x1b[2m${s}\x1b[22m`;
+const out = (s) => process.stdout.write(s);
+const note = (s) => out(`\r\n\x1b[36m${s}\x1b[0m\r\n`);
+
+let server, screens, target, ptr, bounds, cache;
+let windows = [], winIndex = -1, lastCycle = 0, picking = false;
+let mouseOn = opts.mouse, relative = opts.relative, lastCell = null, prefixArmed = false;
+
+function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+function send(line) { server.send(line); }
+
+function moveAbs(x, y) {
+  ptr = { x: clamp(x, bounds.x0, bounds.x1), y: clamp(y, bounds.y0, bounds.y1) };
+  send(`m ${ptr.x} ${ptr.y}`);
+}
+
+// Absolute mode treats the terminal window as the screen; relative mode
+// accumulates cell deltas so you can reach any pixel with repeated motion.
+function onMouseCell(x, y) {
+  const cols = process.stdout.columns || 80;
+  const rows = process.stdout.rows || 24;
+  if (relative) {
+    if (lastCell) moveAbs(ptr.x + (x - lastCell.x) * opts.sens, ptr.y + (y - lastCell.y) * opts.sens);
+    lastCell = { x, y };
+    return;
+  }
+  const s = target;
+  moveAbs(s.x + Math.round((x - 0.5) / cols * s.w), s.y + Math.round((y - 0.5) / rows * s.h));
+}
+
+function onMouse(ev) {
+  const button = ev.b & 3;
+  if (ev.b & 64) { send(`w ${button === 0 ? -1 : 1}`); return; }  // 64 up, 65 down
+  onMouseCell(ev.x, ev.y);
+  if (ev.b & 32) return;                                          // motion only
+  const jb = button === 0 ? 1 : button === 1 ? 2 : 3;
+  send(`b ${jb} ${ev.press ? 'down' : 'up'}`);
+  if (opts.echo && !ev.press) out(dim(`⟨click${jb}⟩`));
+}
+
+const CSI_LETTER = { A: 'up', B: 'down', C: 'right', D: 'left', H: 'home', F: 'end' };
+const CSI_TILDE = { 1: 'home', 2: 'ins', 3: 'del', 4: 'end', 5: 'pgup', 6: 'pgdn', 7: 'home',
+                    8: 'end', 11: 'f1', 12: 'f2', 13: 'f3', 14: 'f4', 15: 'f5', 17: 'f6',
+                    18: 'f7', 19: 'f8', 20: 'f9', 21: 'f10', 23: 'f11', 24: 'f12' };
+const SS3 = { A: 'up', B: 'down', C: 'right', D: 'left', H: 'home', F: 'end',
+              P: 'f1', Q: 'f2', R: 'f3', S: 'f4' };
+
+function withMods(key, mods) {
+  const m = [];
+  if (mods & 4) m.push('ctrl');
+  if (mods & 2) m.push('alt');
+  if (mods & 1) m.push('shift');
+  return m.length ? { type: 'chord', spec: `${m.join('+')}+${key}` } : { type: 'key', key };
+}
+
+// Returns {len, event} once a full sequence is present, or null if we need more bytes.
+function parseEsc(b) {
+  if (b.length < 2) return null;
+  if (b[1] === 0x5b) {                                            // CSI
+    let i = 2;
+    if (b[i] === 0x3c) {                                          // SGR mouse: ESC [ < b;x;y M/m
+      let j = i + 1;
+      while (j < b.length && b[j] !== 0x4d && b[j] !== 0x6d) j++;
+      if (j >= b.length) return null;
+      const [bt, x, y] = b.toString('ascii', i + 1, j).split(';').map(Number);
+      return { len: j + 1, event: { type: 'mouse', b: bt, x, y, press: b[j] === 0x4d } };
+    }
+    while (i < b.length && b[i] >= 0x30 && b[i] <= 0x3f) i++;
+    while (i < b.length && b[i] >= 0x20 && b[i] <= 0x2f) i++;
+    if (i >= b.length) return null;
+    const final = String.fromCharCode(b[i]);
+    const params = b.toString('ascii', 2, i).split(';');
+    const mods = params.length > 1 ? (parseInt(params[1], 10) || 1) - 1 : 0;
+    if (final === 'Z') return { len: i + 1, event: { type: 'chord', spec: 'shift+tab' } };
+    if (CSI_LETTER[final]) return { len: i + 1, event: withMods(CSI_LETTER[final], mods) };
+    if (final === '~') {
+      const key = CSI_TILDE[parseInt(params[0], 10)];
+      return { len: i + 1, event: key ? withMods(key, mods) : null };
+    }
+    return { len: i + 1, event: null };
+  }
+  if (b[1] === 0x4f) {                                            // SS3
+    if (b.length < 3) return null;
+    const key = SS3[String.fromCharCode(b[2])];
+    return { len: 3, event: key ? { type: 'key', key } : null };
+  }
+  return { len: 2, event: { type: 'chord', spec: `alt+${String.fromCharCode(b[1])}` } };
+}
+
+function ctrlEvent(byte) {
+  if (byte === 0x0d || byte === 0x0a) return { type: 'key', key: 'enter' };
+  if (byte === 0x09) return { type: 'key', key: 'tab' };
+  if (byte === 0x7f) return { type: 'key', key: 'bksp' };
+  if (byte === 0x00) return { type: 'chord', spec: 'ctrl+space' };
+  if (byte === 0x1c) return { type: 'chord', spec: 'ctrl+\\' };
+  if (byte === 0x1d) return { type: 'chord', spec: 'ctrl+]' };
+  if (byte === 0x1e) return { type: 'chord', spec: 'ctrl+6' };
+  if (byte === 0x1f) return { type: 'chord', spec: 'ctrl+-' };
+  if (byte >= 0x01 && byte <= 0x1a) return { type: 'chord', spec: `ctrl+${String.fromCharCode(96 + byte)}` };
+  return null;
+}
+
+function emit(ev) {
+  if (!ev) return;
+  if (ev.type === 'mouse') { onMouse(ev); return; }
+  if (ev.type === 'text') {
+    send(`t ${ev.text}`);
+    if (opts.echo) out(dim(ev.text));
+  } else if (ev.type === 'key') {
+    send(`k ${ev.key}`);
+    if (opts.echo) out(ev.key === 'enter' ? dim('⏎') + '\r\n' : dim(`⟨${ev.key}⟩`));
+  } else if (ev.type === 'chord') {
+    send(`c ${ev.spec}`);
+    if (opts.echo) out(dim(`⟨${ev.spec}⟩`));
+  }
+}
+
+function fmtWin(w, n) {
+  const tag = n == null ? '' : `  ${String(n).padStart(2)} `;
+  return `${tag}${w.focused ? '*' : ' '} ${w.proc.padEnd(18)} ${w.title.slice(0, 58)}`;
+}
+
+function showFocus() {
+  try {
+    const fg = wincl.foreground(cache);
+    note(fg ? `focus: ${fg.proc} - ${fg.title}` : 'focus: (none)');
+  } catch (e) { note(`window query failed: ${e.message}`); }
+}
+
+// Snapshot the list for a burst of Tabs so repeated presses walk the whole
+// list instead of toggling between the top two (focusing reorders z-order).
+function cycleWindow(dir) {
+  try {
+    const now = Date.now();
+    if (!windows.length || now - lastCycle > 2000) {
+      windows = wincl.list(cache);
+      winIndex = windows.findIndex((w) => w.focused);
+    }
+    lastCycle = now;
+    if (!windows.length) { note('no switchable windows found'); return; }
+    winIndex = ((winIndex + dir) % windows.length + windows.length) % windows.length;
+    const want = windows[winIndex];
+    const got = wincl.focus(cache, want.hwnd);
+    note(got && got.hwnd === want.hwnd
+      ? `focus -> ${want.proc} - ${want.title}`
+      : `focus refused by Windows -> ${want.proc} - ${want.title}`);
+  } catch (e) { note(`window switch failed: ${e.message}`); }
+}
+
+function listWindows() {
+  try {
+    windows = wincl.list(cache);
+    winIndex = windows.findIndex((w) => w.focused);
+    out('\r\n');
+    windows.forEach((w, i) => out(dim(fmtWin(w, i)) + '\r\n'));
+    out(dim('   press a number to focus it, anything else to cancel') + '\r\n');
+    picking = true;
+  } catch (e) { note(`window list failed: ${e.message}`); }
+}
+
+function pick(ev) {
+  picking = false;
+  if (ev.type !== 'text' || !/^\d/.test(ev.text)) { note('cancelled'); return; }
+  const i = parseInt(ev.text, 10);
+  if (!(i >= 0 && i < windows.length)) { note(`no window ${i}`); return; }
+  winIndex = i;
+  const want = windows[i];
+  const got = wincl.focus(cache, want.hwnd);
+  note(got && got.hwnd === want.hwnd
+    ? `focus -> ${want.proc} - ${want.title}`
+    : `focus refused by Windows -> ${want.proc} - ${want.title}`);
+}
+
+function cycleScreen() {
+  target = screens[(screens.indexOf(target) + 1) % screens.length];
+  note(`mouse -> screen ${target.index} ${target.id} ${target.w}x${target.h}`);
+}
+
+function handlePrefix(ev) {
+  if (matchesPrefix(ev)) { emit(ev); return; }          // prefix twice = send it
+  if (ev.type === 'key' && ev.key === 'tab') { cycleWindow(1); return; }
+  if (ev.type === 'chord' && ev.spec === 'shift+tab') { cycleWindow(-1); return; }
+  if (ev.type !== 'text' || !ev.text.length) { note('prefix cancelled'); return; }
+  const ch = ev.text[0];
+  const rest = ev.text.slice(1);
+  if (ch === 'q' || ch === '.') { quit(); return; }
+  if (ch === '?' || ch === 'h') { out('\r\n' + HELP.replace(/\n/g, '\r\n')); }
+  else if (ch === 'm') {
+    mouseOn = !mouseOn;
+    out(mouseOn ? '\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h' : '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l');
+    note(`mouse capture ${mouseOn ? 'on' : 'off'}`);
+  }
+  else if (ch === 'r') { relative = !relative; lastCell = null; note(`mouse mode: ${relative ? 'relative' : 'absolute'}`); }
+  else if (ch === 's') { cycleScreen(); }
+  else if (ch === 'w') { listWindows(); }
+  else if (ch === 'f') { showFocus(); }
+  else note(`unknown prefix command '${ch}' (${PREFIX_LABEL} then ? for help)`);
+  if (rest) emit({ type: 'text', text: rest });
+}
+
+let buf = Buffer.alloc(0);
+let escTimer = null;
+let ready = false;
+
+// Decodes one event off the front of buf. Returns null when more bytes are
+// needed to finish a sequence.
+function nextEvent() {
+  const byte = buf[0];
+  if (byte === 0x1b) {
+    const parsed = parseEsc(buf);
+    return parsed ? { len: parsed.len, event: parsed.event } : null;
+  }
+  if (byte < 0x20 || byte === 0x7f) return { len: 1, event: ctrlEvent(byte) };
+  let i = 0;
+  while (i < buf.length && buf[i] >= 0x20 && buf[i] !== 0x7f) i++;
+  // Do not split a multi-byte UTF-8 character across chunk boundaries.
+  if (i === buf.length) {
+    let k = i - 1;
+    while (k >= 0 && (buf[k] & 0xc0) === 0x80) k--;
+    if (k >= 0 && buf[k] >= 0xc0) {
+      const need = buf[k] >= 0xf0 ? 4 : buf[k] >= 0xe0 ? 3 : 2;
+      if (i - k < need) i = k;
+    }
+  }
+  if (i === 0) return null;
+  return { len: i, event: { type: 'text', text: buf.slice(0, i).toString('utf8') } };
+}
+
+function describe(ev) {
+  if (!ev) return 'ignored';
+  if (ev.type === 'text') return `text ${JSON.stringify(ev.text)}`;
+  if (ev.type === 'key') return `key ${ev.key}`;
+  if (ev.type === 'chord') return `chord ${ev.spec}`;
+  if (ev.type === 'mouse') return `mouse b=${ev.b} ${ev.x},${ev.y} ${ev.press ? 'press' : 'release'}`;
+  return ev.type;
+}
+
+function drain() {
+  if (!ready) return;
+  while (buf.length) {
+    const r = nextEvent();
+    if (!r) return;
+    const raw = buf.slice(0, r.len);
+    buf = buf.slice(r.len);
+    const ev = r.event;
+
+    if (opts.debugKeys) {
+      const hex = [...raw].map((b) => b.toString(16).padStart(2, '0')).join(' ');
+      const tag = ev && matchesPrefix(ev) ? '  <- prefix' : '';
+      out(`  ${hex.padEnd(24)} ${describe(ev)}${tag}\r\n`);
+      if (raw.length === 1 && raw[0] === 0x03) { out('\r\n'); process.stdin.setRawMode(false); process.exit(0); }
+      continue;
+    }
+
+    if (!ev) continue;
+    if (picking) { pick(ev); continue; }
+    if (prefixArmed) { prefixArmed = false; handlePrefix(ev); continue; }
+    if (matchesPrefix(ev)) { prefixArmed = true; continue; }
+    emit(ev);
+  }
+}
+
+async function quit() {
+  if (process.stdin.isTTY) {
+    out('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l');
+    process.stdin.setRawMode(false);
+  }
+  out('\r\n');
+  if (server) await server.close();
+  process.exit(0);
+}
+
+function attachStdin() {
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  process.stdin.on('data', (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    if (escTimer) { clearTimeout(escTimer); escTimer = null; }
+    drain();
+    // A lone ESC never completes a sequence; flush it as the Escape key.
+    if (ready && buf.length === 1 && buf[0] === 0x1b) {
+      escTimer = setTimeout(() => { buf = buf.slice(1); emit({ type: 'key', key: 'esc' }); }, 60);
+    }
+  });
+}
+
+(async function main() {
+  attachStdin();
+
+  // Pure local key inspector: never starts the JVM, never sends anything.
+  if (opts.debugKeys) {
+    out(`\x1b[36mwinput --debug-keys\x1b[0m - press keys to see what this terminal sends.\r\n`);
+    out(dim(`  looking for prefix: ${PREFIX_LABEL}   (Ctrl-C to exit)`) + '\r\n\r\n');
+    ready = true;
+    drain();
+    return;
+  }
+
+  server = robot.start({ delay: opts.delay });
+  server.proc.stderr.on('data', (d) => process.stderr.write(`\r\n[java] ${d}`));
+  server.proc.on('exit', (code) => { if (code) { note(`RobotServer exited (${code})`); process.exit(1); } });
+  await server.ready();
+
+  cache = robot.winCache();
+  screens = await robot.screens(server);
+  target = opts.screen != null
+    ? (screens.find((s) => s.index === opts.screen) || screens[0])
+    : (screens.find((s) => s.primary) || screens[0]);
+  bounds = {
+    x0: Math.min(...screens.map((s) => s.x)),
+    y0: Math.min(...screens.map((s) => s.y)),
+    x1: Math.max(...screens.map((s) => s.x + s.w - 1)),
+    y1: Math.max(...screens.map((s) => s.y + s.h - 1)),
+  };
+  ptr = await robot.pointer(server);
+
+  const pfx = PREFIX_LABEL;
+  out(`\x1b[36mwinput\x1b[0m connected - keystrokes now go to the focused Windows window.\r\n`);
+  out(dim(`  screens: ${screens.map((s) => `${s.index}:${s.w}x${s.h}${s.primary ? '*' : ''}`).join('  ')}`) + '\r\n');
+  out(dim(`  mouse: ${mouseOn ? (relative ? 'relative' : 'absolute -> screen ' + target.index) : 'off'}   ${pfx} ? for help, ${pfx} q to quit`) + '\r\n');
+
+  if (opts.focus) {
+    const win = wincl.match(wincl.list(cache), opts.focus);
+    if (!win) note(`no window matching '${opts.focus}'`);
+    else {
+      const got = wincl.focus(cache, win.hwnd);
+      note(got && got.hwnd === win.hwnd
+        ? `focus -> ${win.proc} - ${win.title}`
+        : `focus refused by Windows -> ${win.proc} - ${win.title}`);
+    }
+  }
+
+  // Say where the keystrokes will actually land - the thing that is easy to
+  // get wrong when the target screen is across the room.
+  try {
+    const fg = wincl.foreground(cache);
+    if (fg) out(`  \x1b[33mtyping into:\x1b[0m ${fg.proc} - ${fg.title}` + dim(`   (${pfx} Tab to switch)`) + '\r\n');
+  } catch (e) { out(dim(`  (window switching unavailable: ${e.message})`) + '\r\n'); }
+  out('\r\n');
+
+  if (mouseOn) out('\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h');
+
+  ready = true;
+  drain();                                   // replay anything typed during startup
+  process.on('SIGTERM', quit);
+  process.on('SIGHUP', quit);
+})().catch((e) => {
+  try { if (process.stdin.isTTY) process.stdin.setRawMode(false); } catch {}
+  process.stderr.write(`\r\nwinput: ${e.message}\r\n`);
+  process.exit(1);
+});
