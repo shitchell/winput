@@ -59,9 +59,24 @@ itself, press the prefix (**Ctrl-]**) then:
 | `s` | cycle target screen |
 | `Tab` / `Shift-Tab` | next / previous window |
 | `Right` / `Left` | move the focused window to the next / previous monitor |
+| `F` | send F11 (fullscreen), for when your own terminal eats the key |
 | `w` | pick a window from a numbered list |
 | `f` | show which window currently has focus |
 | the prefix again | send the prefix key itself |
+
+## Function keys
+
+F1–F12 are forwarded like anything else — just press them. The catch is that
+your *local* terminal may claim one before winput ever sees it; F11 is the
+usual offender, since most terminals bind it to their own fullscreen.
+
+`Ctrl-] F` sends F11 regardless, which is the reliable way to fullscreen the
+app on the far machine (handy for a half-height quake terminal you want to read
+from across the room).
+
+To find out whether a key reaches winput at all, run `winput --debug-keys` and
+press it: if nothing prints, something upstream swallowed it and a prefix
+shortcut is the way round it.
 
 ## Which window am I typing into?
 

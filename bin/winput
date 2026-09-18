@@ -32,6 +32,7 @@ prefix (Ctrl-] by default) followed by:
   Tab      next window       S-Tab   previous window
   w        pick a window     f       show which window has focus
   Right    focused window to next monitor            Left  previous monitor
+  F        send F11 (fullscreen) - for when your own terminal eats the key
 
 If the prefix never reaches winput (a terminal or multiplexer may eat it),
 run  winput --debug-keys  to see what your terminal really sends, then pick
@@ -337,6 +338,9 @@ function handlePrefix(ev) {
   else if (ch === 's') { cycleScreen(); }
   else if (ch === 'w') { listWindows(); }
   else if (ch === 'f') { showFocus(); }
+  // Most terminals bind F11 to their own fullscreen, so it never reaches us.
+  // This gives the focused Windows app a path to it regardless.
+  else if (ch === 'F') { send('k f11'); note('sent F11 (fullscreen toggle)'); }
   else note(`unknown prefix command '${ch}' (${PREFIX_LABEL} then ? for help)`);
   if (rest) emit({ type: 'text', text: rest });
 }
